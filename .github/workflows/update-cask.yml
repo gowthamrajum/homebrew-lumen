@@ -1,0 +1,134 @@
+# Keep the cask level with the app's latest release — with no credential
+# anywhere.
+#
+# The obvious place for this is the app's own release workflow, and that is
+# where it used to live. It cannot work there: a workflow's automatic
+# GITHUB_TOKEN is scoped to the repository it runs in, so a job in
+# lumen-presenter can never push to this repo without a token or deploy key
+# somebody has to create, store and eventually rotate. It skipped silently for
+# want of one, and the cask fell three releases behind.
+#
+# Inverted, it needs nothing: this workflow runs HERE, so its own token may push
+# here, and reading lumen-presenter's releases needs no authentication at all
+# because that repository is public.
+#
+# The cost is that it polls rather than being told. A release is usable from the
+# GitHub page immediately; the cask catches up within the interval below.
+#
+# One caveat worth knowing: GitHub disables scheduled workflows after 60 days of
+# repository inactivity. This workflow's own commits count as activity, so it
+# sustains itself as long as a release happens within any 60-day window. If one
+# doesn't, GitHub emails a one-click re-enable — and Run workflow always works.
+name: Update cask
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to pin to (default: whatever is latest)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-cask
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version comparison happens BEFORE anything is downloaded: the two
+      # disk images are ~280 MB together, and every half hour the honest answer
+      # is almost always "nothing changed".
+      - name: Find the release worth having
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo=gowthamrajum/lumen-presenter
+          want='${{ github.event.inputs.tag }}'
+          if [ -n "$want" ]; then
+            tag="$want"
+          else
+            # --exclude-drafts/-pre-releases: a draft is not released yet, and
+            # publishing the cask for one would offer downloads nobody can get.
+            tag="$(gh release list --repo "$repo" --limit 20 --exclude-drafts --exclude-pre-releases \
+                   --json tagName,isLatest -q '[.[]|select(.isLatest)][0].tagName')"
+          fi
+          [ -n "$tag" ] && [ "$tag" != "null" ] || { echo "no published release found"; exit 0; }
+          v="${tag#v}"
+          have="$(sed -n 's/^  version "\(.*\)"$/\1/p' Casks/cantica.rb)"
+          echo "latest=$v  cask=$have"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$v" = "$have" ]; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Take the checksums from the published disk images
+        if: steps.rel.outputs.changed == 'true'
+        id: sums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v='${{ steps.rel.outputs.version }}'
+          tmp="$(mktemp -d)"
+          gh release download '${{ steps.rel.outputs.tag }}' --repo gowthamrajum/lumen-presenter \
+             --pattern '*.dmg' --dir "$tmp"
+          # A release without both disk images (a Windows-only build, an upload
+          # that failed) must not become a cask pointing at files that aren't
+          # there. Stopping leaves the previous version installable.
+          for f in "Cantica-$v-arm64.dmg" "Cantica-$v.dmg"; do
+            [ -s "$tmp/$f" ] || { echo "::warning::$f missing from the release — leaving the cask alone"; exit 0; }
+          done
+          echo "arm=$(sha256sum "$tmp/Cantica-$v-arm64.dmg" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "intel=$(sha256sum "$tmp/Cantica-$v.dmg" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          rm -rf "$tmp"
+
+      # Three lines are replaced, not the whole file. The cask carries things
+      # written by hand — the quarantine postflight, the zap list — and a
+      # generator that reproduced the file from scratch would quietly drop
+      # whatever it had not been taught about.
+      - name: Rewrite the version and the checksums
+        if: steps.sums.outputs.arm != '' && steps.sums.outputs.intel != ''
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          p = 'Casks/cantica.rb'
+          s = open(p).read()
+          v, arm, intel = '${{ steps.rel.outputs.version }}', '${{ steps.sums.outputs.arm }}', '${{ steps.sums.outputs.intel }}'
+
+          s, n = re.subn(r'^(  version ")[^"]*(")$', rf'\g<1>{v}\g<2>', s, count=1, flags=re.M)
+          if n != 1: sys.exit('could not find the version line')
+
+          # Anchored to its own on_arm / on_intel block, so the two checksums can
+          # never be written the wrong way round.
+          def one(src, block, digest):
+              pat = re.compile(r'(on_' + block + r' do\s*\n\s*sha256 ")[0-9a-f]{64}(")')
+              out, k = pat.subn(rf'\g<1>{digest}\g<2>', src, count=1)
+              if k != 1: sys.exit(f'could not find the {block} sha256')
+              return out
+
+          s = one(s, 'arm', arm)
+          s = one(s, 'intel', intel)
+          open(p, 'w').write(s)
+          PY
+          ruby -c Casks/cantica.rb
+
+      - name: Commit it
+        if: steps.sums.outputs.arm != '' && steps.sums.outputs.intel != ''
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Casks/cantica.rb
+          # Nothing staged means the release was already the one described here.
+          git diff --cached --quiet && { echo "cask already current"; exit 0; }
+          git commit -m 'cantica ${{ steps.rel.outputs.version }}'
+          git push
