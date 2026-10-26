@@ -4,15 +4,15 @@
 cask "cantica" do
   arch arm: "arm64", intel: "x64"
 
-  version "0.2.60"
+  version "0.2.61"
 
   on_arm do
-    sha256 "6e276b8ae0cf1d2b636acce69ef855b5aaffe6e3a67f6f5b9fc33ddc75e9688a"
+    sha256 "2e0c94f451ef688550c9a21ee2e6cfdd35a96441bdfc42934e3e3844f527ee13"
 
     url "https://github.com/gowthamrajum/lumen-presenter/releases/download/v#{version}/Cantica-#{version}-arm64.dmg"
   end
   on_intel do
-    sha256 "8ac436cfb16aa2a412191111ab894747acfbebedcb2959e0747f8a9f4bce8232"
+    sha256 "4d83a20a5ceeac0978188e2b775ba4cee55ffed8d2dc9cbc600554597450581a"
 
     url "https://github.com/gowthamrajum/lumen-presenter/releases/download/v#{version}/Cantica-#{version}.dmg"
   end
